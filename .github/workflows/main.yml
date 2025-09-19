@@ -1,0 +1,126 @@
+name: Secure RDP with Auto-Renewal
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 3600
+    
+    steps:
+    - name: Configure Secure RDP Settings
+      run: |
+        # Enable RDP with better security
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 2 -Force
+        
+        # Configure firewall
+        netsh advfirewall firewall delete rule name="RDP-Tailscale"
+        netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+        
+        Restart-Service -Name TermService -Force
+
+    - name: Create Secure RDP User
+      run: |
+        # Generate random password
+        $password = -join ((33..126) | Get-Random -Count 16 | ForEach-Object {[char]$_})
+        $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+        # Create or update user
+        if (Get-LocalUser -Name "TOOLBOXLAP" -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name "TOOLBOXLAP" -Password $securePass
+        } else {
+            New-LocalUser -Name "TOOLBOXLAP" -Password $securePass -AccountNeverExpires
+        }
+
+        Add-LocalGroupMember -Group "Administrators" -Member "TOOLBOXLAP"
+        Add-LocalGroupMember -Group "Remote Desktop Users" -Member "TOOLBOXLAP"
+
+        echo "RDP_CREDS=TOOLBOXLAP|$password" >> $env:GITHUB_ENV
+        echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+    - name: Install and Configure Tailscale
+      run: |
+        # Download and install Tailscale
+        $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+        $installerPath = "$env:TEMP\tailscale.msi"
+        
+        Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+        Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+        Remove-Item $installerPath -Force
+        
+        # Connect to Tailscale with keepalive
+        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID --reset
+        & "$env:ProgramFiles\Tailscale\tailscale.exe" set --keepalive=60s
+        
+        # Get Tailscale IP
+        $tsIP = $null
+        $retries = 0
+        while (-not $tsIP -and $retries -lt 15) {
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            if (-not $tsIP) { Start-Sleep -Seconds 2 }
+            $retries++
+        }
+        
+        if (-not $tsIP) {
+            Write-Error "Tailscale IP not assigned"
+            exit 1
+        }
+        echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+    - name: Verify and Maintain Connection
+      run: |
+        Write-Host "=== RDP ACCESS INFORMATION ==="
+        Write-Host "Address: $env:TAILSCALE_IP"
+        Write-Host "Username: TOOLBOXLAP"
+        Write-Host "Password: $env:RDP_PASSWORD"
+        Write-Host "============================="
+        
+        # Function to check connection
+        function Test-RDPConnection {
+            param($ip)
+            try {
+                $test = Test-NetConnection -ComputerName $ip -Port 3389 -WarningAction SilentlyContinue
+                return $test.TcpTestSucceeded
+            } catch {
+                return $false
+            }
+        }
+        
+        # Main loop with auto-renewal
+        $lastCheck = Get-Date
+        $connectionCount = 0
+        
+        while ($true) {
+            $currentTime = Get-Date
+            
+            # Check connection every 30 seconds
+            if (($currentTime - $lastCheck).TotalSeconds -ge 30) {
+                if (Test-RDPConnection -ip $env:TAILSCALE_IP) {
+                    Write-Host "[$(Get-Date)] ✅ RDP Connection Active"
+                } else {
+                    Write-Host "[$(Get-Date)] ❌ RDP Connection Failed - Attempting renewal"
+                    
+                    # Renew Tailscale connection
+                    & "$env:ProgramFiles\Tailscale\tailscale.exe" up --reset
+                    & "$env:ProgramFiles\Tailscale\tailscale.exe" set --keepalive=60s
+                    
+                    # Update IP if changed
+                    $newIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+                    if ($newIP -and $newIP -ne $env:TAILSCALE_IP) {
+                        echo "TAILSCALE_IP=$newIP" >> $env:GITHUB_ENV
+                        Write-Host "[$(Get-Date)] 🔄 IP Changed: $newIP"
+                    }
+                }
+                $lastCheck = $currentTime
+                $connectionCount++
+            }
+            
+            # Keepalive signal every 5 minutes
+            if (($connectionCount % 10) -eq 0) {
+                Write-Host "[$(Get-Date)] ♻️  Connection refresh cycle completed"
+            }
+            
+            Start-Sleep -Seconds 5
+        }
